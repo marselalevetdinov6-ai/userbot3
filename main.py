@@ -1,807 +1,522 @@
-#!/usr/bin/env python3
-"""
-Telegram User Bot без использования events - только базовые методы
-"""
-
 import asyncio
-import logging
 import json
 import os
-import sys
-import getpass
-import time
-from datetime import datetime, timedelta
-from telethon import TelegramClient, errors
+import re
+import logging
+from datetime import datetime
+from typing import List, Optional, Set
+from enum import Enum
+from telethon import TelegramClient, events
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.errors import (
+    FloodWaitError, ChannelPrivateError, ChatAdminRequiredError,
+    UserAlreadyParticipantError, UsernameNotOccupiedError,
+    UsernameInvalidError, InviteHashExpiredError,
+    InviteHashInvalidError, InviteRequestSentError
+)
+from telethon.tl.types import Channel, Chat, User
+from dataclasses import dataclass, asdict
+from dataclasses_json import dataclass_json
+
+# ==================== КОНФИГУРАЦИЯ ====================
+API_ID = 30320335  # Получите на my.telegram.org
+API_HASH = 'c19aaafc21ca4cedbd72b89ec8a7c544'  # Получите на my.telegram.org
+PHONE_NUMBER = '+19017175662'  # Ваш номер телефона
+
+# Настройки бота
+TARGET_BOT = 'gram_piarbot'  # Бот, сообщения которого будем обрабатывать
+MESSAGE_INTERVAL = 5  # Интервал между отправкой сообщений в секундах
+JOIN_DELAY = 5  # Задержка между вступлениями в секундах
+MAX_JOIN_ATTEMPTS = 3  # Максимальное количество попыток вступления
+
+# Настройки для ответов на личные сообщения
+RESPONSE_ENABLED = True  # Включить ответы на личные сообщения
+AUTO_JOIN_FROM_PM = True  # Автоматически вступать в каналы из личных сообщений
+RESPONSE_MESSAGE = "✅ Спасибо за сообщение! Я автоматически обработаю все ссылки на каналы и чаты."
+
+# Паттерны для поиска ссылок
+LINK_PATTERNS = [
+    r'https?://t.me/joinchat/([a-zA-Z0-9_-]+)',  # Приватные ссылки
+    r'https?://t.me/+([a-zA-Z0-9_-]+)',  # Приватные ссылки с +
+    r't.me/([a-zA-Z0-9_]+)',  # Публичные ссылки
+    r'telegram.me/([a-zA-Z0-9_]+)',  # Альтернативные ссылки
+    r'@([a-zA-Z0-9_]{5,32})'  # Username
+]
+
+# ==================== ЛОГИРОВАНИЕ ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bot.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 
-# ========== КОНФИГУРАЦИЯ ==========
-class Config:
-    # Получите на https://my.telegram.org
-    API_ID = 30320335  # Получите на my.telegram.org
-    API_HASH = 'c19aaafc21ca4cedbd72b89ec8a7c544'  # Получите на my.telegram.org
-
-    # Файл сессии
-    SESSION_FILE = 'user_bot.session'
-
-    # Настройки автоотправки
-    AUTO_SEND_ENABLED = True  # Включить автоотправку
-    AUTO_SEND_INTERVAL = 180  # Интервал в секундах (3 минуты)
-    AUTO_SEND_CHATS = []  # Список чатов для автоотправки (ID или username)
-    AUTO_SEND_MESSAGES = []  # Список сообщений для ротации
-
-    # Настройки
-    LOG_LEVEL = logging.INFO
+# ==================== МОДЕЛИ ДАННЫХ ====================
+class ChatStatus(Enum):
+    ACTIVE = "active"
+    PAUSED = "paused"
+    LEFT = "left"
+    BANNED = "banned"
 
 
-# ========== КЛАСС БОТА ==========
-class TelegramUserBot:
+@dataclass_json
+@dataclass
+class ChatInfo:
+    id: int
+    title: str
+    username: Optional[str]
+    link: str
+    status: ChatStatus
+    joined_at: str
+    last_activity: str
+    is_group: bool = False
+    is_channel: bool = False
+    participants_count: int = 0
+
+
+# ==================== ОСНОВНОЙ КЛАСС БОТА ====================
+class TelegramAutoJoinBot:
     def __init__(self):
         self.client = None
-        self.is_running = False
-        self.auto_send_task = None
-        self.message_check_task = None
-        self.auto_send_enabled = Config.AUTO_SEND_ENABLED
-        self.auto_send_interval = Config.AUTO_SEND_INTERVAL
-        self.auto_send_chats = Config.AUTO_SEND_CHATS.copy()
-        self.auto_send_messages = Config.AUTO_SEND_MESSAGES.copy()
-        self.message_index = 0
-        self.next_send_time = None
-        self.last_message_id = {}  # Для отслеживания последних сообщений по чатам
+        self.chats = {}  # id -> ChatInfo
+        self.active_chats = set()  # id активных чатов
+        self.data_file = 'chats_data.json'
+        self.joined_channels_file = 'joined_channels.json'
+        self.message_text = ""
 
-    async def interactive_auth(self):
-        """Интерактивная авторизация"""
-        print("\n" + "=" * 50)
-        print("🔐 АВТОРИЗАЦИЯ TELEGRAM USER BOT")
-        print("=" * 50)
+        # Загружаем сохраненные данные
+        self.load_data()
 
-        # Запрашиваем данные у пользователя
-        phone = input("\n📱 Введите номер телефона (например, +79123456789): ").strip()
-
-        if not phone:
-            print("❌ Номер телефона обязателен!")
-            return False
-
-        # Запускаем клиент
-        self.client = TelegramClient(
-            Config.SESSION_FILE,
-            Config.API_ID,
-            Config.API_HASH
-        )
-
+    def load_data(self):
+        """Загружает сохраненные данные из файла"""
         try:
-            # Подключаемся
-            await self.client.connect()
-
-            # Отправляем код
-            sent_code = await self.client.send_code_request(phone)
-            print(f"\n✅ Код отправлен на номер {phone}")
-
-            # Запрашиваем код
-            code = input("\n🔢 Введите код из Telegram: ").strip()
-
-            if not code:
-                print("❌ Код обязателен!")
-                return False
-
-            # Пытаемся войти
-            try:
-                await self.client.sign_in(phone, code)
-                print("✅ Успешная авторизация!")
-                return True
-
-            except errors.SessionPasswordNeededError:
-                # Нужен пароль 2FA
-                print("\n🔐 Требуется пароль двухфакторной аутентификации")
-                password = getpass.getpass("Введите пароль 2FA: ")
-                await self.client.sign_in(password=password)
-                print("✅ Успешная авторизация с 2FA!")
-                return True
-
-        except errors.PhoneNumberInvalidError:
-            print("❌ Неверный номер телефона")
-            return False
-        except errors.PhoneCodeInvalidError:
-            print("❌ Неверный код подтверждения")
-            return False
-        except errors.PhoneCodeExpiredError:
-            print("❌ Срок действия кода истек")
-            return False
+            if os.path.exists(self.data_file):
+                with open(self.data_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    for chat_id, chat_data in data.get('chats', {}).items():
+                        chat_info = ChatInfo.from_dict(chat_data)
+                        chat_info.status = ChatStatus(chat_data['status'])
+                        self.chats[int(chat_id)] = chat_info
+                        if chat_info.status == ChatStatus.ACTIVE:
+                            self.active_chats.add(int(chat_id))
+                logger.info(f"📂 Загружено {len(self.chats)} сохраненных чатов")
         except Exception as e:
-            print(f"❌ Ошибка авторизации: {e}")
-            return False
+            logger.error(f"❌ Ошибка загрузки данных: {e}")
+            self.chats = {}
+            self.active_chats = set()
 
-    async def initialize(self):
-        """Инициализация бота"""
-        print("\n" + "=" * 50)
-        print("🤖 TELEGRAM USER BOT v5.0 (без events)")
-        print("=" * 50)
+    def save_data(self):
+        """Сохраняет данные в файл"""
+        try:
+            data = {
+                'chats': {str(chat_id): asdict(chat_info) for chat_id, chat_info in self.chats.items()}
+            }
+            with open(self.data_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            logger.info("💾 Данные сохранены")
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения данных: {e}")
 
-        # Проверяем API данные
-        if Config.API_ID == 1234567 or Config.API_HASH == 'ваш_api_hash_здесь':
-            print("\n❌ ОШИБКА: Не настроены API данные!")
-            print("\nИнструкция по получению API:")
-            print("1. Перейдите на https://my.telegram.org")
-            print("2. Войдите в свой аккаунт Telegram")
-            print("3. Создайте приложение в разделе 'API Development Tools'")
-            print("4. Скопируйте API_ID и API_HASH")
-            print("5. Вставьте их в файл main.py")
-            return False
+    def extract_links(self, text: str) -> List[str]:
+        """Извлекает все ссылки на Telegram из текста"""
+        links = []
 
-        # Проверяем существующую сессию
-        if os.path.exists(Config.SESSION_FILE):
-            print("\n📂 Найдена сохраненная сессия...")
-            self.client = TelegramClient(
-                Config.SESSION_FILE,
-                Config.API_ID,
-                Config.API_HASH
-            )
+        for pattern in LINK_PATTERNS:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for match in matches:
+                if pattern == r'https?://t.me/joinchat/([a-zA-Z0-9_-]+)':
+                    links.append(f"https://t.me/joinchat/{match}")
+                elif pattern == r'https?://t.me/+([a-zA-Z0-9_-]+)':
+                    links.append(f"https://t.me/+{match}")
+                elif pattern in [r't.me/([a-zA-Z0-9_]+)', r'telegram.me/([a-zA-Z0-9_]+)']:
+                    links.append(f"t.me/{match}")
+                elif pattern == r'@([a-zA-Z0-9_]{5,32})':
+                    links.append(f"@{match}")
 
-            try:
-                await self.client.connect()
+        return list(set(links))  # Убираем дубликаты
 
-                # Проверяем валидность сессии
-                if not await self.client.is_user_authorized():
-                    print("❌ Сессия устарела, требуется повторная авторизация")
-                    if not await self.interactive_auth():
-                        return False
+    async def join_channel(self, link: str) -> Optional[ChatInfo]:
+        """Присоединяется к каналу/чату по ссылке и возвращает информацию"""
+        try:
+            logger.info(f"Попытка присоединиться к: {link}")
+
+            # Проверяем, не присоединялись ли уже
+            for chat in self.chats.values():
+                if chat.link == link:
+                    logger.info(f"Уже присоединен к: {link}")
+                    chat.status = ChatStatus.ACTIVE
+                    self.active_chats.add(chat.id)
+                    return chat
+
+            entity = None
+            is_channel = False
+            is_group = False
+
+            # Обработка разных типов ссылок
+            if link.startswith('https://t.me/joinchat/') or link.startswith('https://t.me/+'):
+                # Приватная ссылка с инвайтом
+                invite_hash = link.split('/')[-1]
+                if invite_hash.startswith('+'):
+                    invite_hash = invite_hash[1:]
+
+                try:
+                    result = await self.client(ImportChatInviteRequest(invite_hash))
+                    entity = result.chats[0] if result.chats else None
+                    is_group = True
+                    logger.info(f"Успешно присоединился по приватной ссылке: {link}")
+                except InviteHashExpiredError:
+                    logger.error(f"Ссылка истекла: {link}")
+                    return None
+                except InviteHashInvalidError:
+                    logger.error(f"Неверная ссылка: {link}")
+                    return None
+                except InviteRequestSentError:
+                    logger.info(f"Запрос на присоединение отправлен: {link}")
+                    # Создаем временную запись
+                    chat_info = ChatInfo(
+                        id=hash(link),  # Временный ID
+                        title=link,
+                        username=None,
+                        link=link,
+                        status=ChatStatus.PAUSED,
+                        joined_at=datetime.now().isoformat(),
+                        last_activity=datetime.now().isoformat(),
+                        is_group=True
+                    )
+                    self.chats[chat_info.id] = chat_info
+                    self.save_data()
+                    return chat_info
+
+            else:
+                # Публичный канал/чат
+                # Извлекаем username из ссылки
+                if link.startswith('t.me/'):
+                    username = link[5:]
+                elif link.startswith('@'):
+                    username = link[1:]
                 else:
-                    print("✅ Используется сохраненная сессия")
+                    username = link
 
-            except Exception as e:
-                print(f"❌ Ошибка подключения: {e}")
-                if not await self.interactive_auth():
-                    return False
-        else:
-            print("\n📂 Создание новой сессии...")
-            if not await self.interactive_auth():
-                return False
+                # Убираем возможные параметры
+                username = username.split('?')[0]
+
+                try:
+                    # Пытаемся получить сущность
+                    entity = await self.client.get_entity(username)
+
+                    if isinstance(entity, Channel):
+                        is_channel = True
+                        # Присоединяемся к каналу
+                        await self.client(JoinChannelRequest(entity))
+                        logger.info(f"Успешно присоединился к каналу: {link}")
+                    elif isinstance(entity, Chat):
+                        is_group = True
+                        logger.info(f"Уже в чате: {link}")
+                    else:
+                        logger.error(f"Неизвестный тип сущности: {type(entity)}")
+                        return None
+
+                except (UsernameNotOccupiedError, UsernameInvalidError):
+                    logger.error(f"Неверный username: {link}")
+                    return None
+                except UserAlreadyParticipantError:
+                    logger.info(f"Уже участник: {link}")
+                except ChannelPrivateError:
+                    logger.error(f"Канал приватный: {link}")
+                    return None
+                except Exception as e:
+                    logger.error(f"Ошибка при присоединении к {link}: {e}")
+                    return None
+
+            # Получаем информацию о чате
+            if entity:
+                try:
+                    # Получаем полную информацию
+                    full_chat = await self.client.get_entity(entity)
+
+                    chat_info = ChatInfo(
+                        id=full_chat.id,
+                        title=getattr(full_chat, 'title', link),
+                        username=getattr(full_chat, 'username', None),
+                        link=link,
+                        status=ChatStatus.ACTIVE,
+                        joined_at=datetime.now().isoformat(),
+                        last_activity=datetime.now().isoformat(),
+                        is_group=is_group,
+                        is_channel=is_channel,
+                        participants_count=getattr(full_chat, 'participants_count', 0)
+                    )
+
+                    self.chats[chat_info.id] = chat_info
+                    self.active_chats.add(chat_info.id)
+                    self.save_data()
+
+                    logger.info(f"✅ Успешно присоединился: {chat_info.title}")
+                    return chat_info
+
+                except Exception as e:
+                    logger.error(f"Ошибка получения информации о чате {link}: {e}")
+                    return None
+
+        except FloodWaitError as e:
+            wait_time = e.seconds
+            logger.warning(f"⚠️ FloodWait: ждем {wait_time} секунд")
+            await asyncio.sleep(wait_time)
+            return await self.join_channel(link)  # Повторная попытка
+        except Exception as e:
+            logger.error(f"❌ Неизвестная ошибка при присоединении к {link}: {e}")
+            return None
+
+    async def process_message(self, text: str, source: str):
+        """Обрабатывает сообщение и присоединяется ко всем найденным ссылкам"""
+        logger.info(f"📨 Обработка сообщения от {source}")
+
+        links = self.extract_links(text)
+        if not links:
+            logger.info("ℹ️ Ссылки не найдены")
+            return
+
+        logger.info(f"🔗 Найдено {len(links)} ссылок: {links}")
+
+        results = []
+        for i, link in enumerate(links):
+            logger.info(f"🔄 Обработка ссылки {i + 1}/{len(links)}: {link}")
+
+            # Задержка между обработкой ссылок
+            if i > 0:
+                await asyncio.sleep(JOIN_DELAY)
+
+            chat_info = await self.join_channel(link)
+            if chat_info:
+                results.append(f"✅ {chat_info.title}: {link}")
+            else:
+                results.append(f"❌ Не удалось присоединиться: {link}")
+        return
+
+    async def run(self):
+        """Основной метод запуска бота"""
+        # Создаем клиент
+        self.client = TelegramClient('session', API_ID, API_HASH)
+
+        # Создаем папку session если ее нет
+        if not os.path.exists('session'):
+            os.makedirs('session')
+
+        # Запускаем клиент с авторизацией
+        logger.info("🔐 Подключение к Telegram...")
+        await self.client.start(phone=PHONE_NUMBER)
+        logger.info("✅ Успешно авторизован!")
 
         # Получаем информацию о себе
         me = await self.client.get_me()
-        print(f"\n✅ Успешный вход как: {me.first_name} (@{me.username})")
-        print(f"🆔 ID пользователя: {me.id}")
+        logger.info(f"👤 Авторизован как: {me.first_name} (@{me.username})")
 
-        # Загружаем конфигурацию автоотправки
-        await self.load_auto_send_config()
+        # ============ РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ СОБЫТИЙ ============
 
-        return True
+        @self.client.on(events.NewMessage())
+        async def message_handler(event):
+            """Обработчик всех сообщений"""
 
-    async def check_new_messages(self):
-        """Проверка новых сообщений (альтернатива events)"""
-        print("\n📡 Начинаю проверку новых сообщений...")
+            # Проверяем, что сообщение от нужного бота
+            sender = await event.get_sender()
+            if sender and hasattr(sender, 'username') and sender.username == TARGET_BOT:
+                logger.info(f"🤖 Сообщение от @{TARGET_BOT}")
 
-        # Получаем все диалоги
-        dialogs = await self.client.get_dialogs(limit=50)
+                # Сохраняем текст сообщения
+                self.message_text = event.message.text
 
-        for dialog in dialogs:
-            chat_id = dialog.id
+                # Обрабатываем сообщение
+                report = await self.process_message(event.message.text, f"@{TARGET_BOT}")
 
-            # Получаем последнее сообщение в диалоге
-            messages = await self.client.get_messages(chat_id, limit=1)
+            # Обработка личных сообщений от пользователей
+            elif event.is_private and RESPONSE_ENABLED:
+                # Не обрабатываем сообщения от самого себя
+                if sender and sender.id == me.id:
+                    return
 
-            if messages:
-                last_msg = messages[0]
-                last_msg_id = last_msg.id
+                logger.info(f"👤 Личное сообщение от {sender.first_name if sender else 'неизвестный'}")
 
-                # Проверяем, новое ли это сообщение
-                if chat_id not in self.last_message_id:
-                    self.last_message_id[chat_id] = last_msg_id
-                    continue
+                # Если включено автоприсоединение, обрабатываем ссылки
+                if AUTO_JOIN_FROM_PM and event.message.text:
+                    report = await self.process_message(event.message.text, f"Пользователь {sender.id}")
+                    if report:
+                        await event.respond(report, parse_mode='Markdown')
 
-                if last_msg_id != self.last_message_id[chat_id]:
-                    # Новое сообщение!
-                    self.last_message_id[chat_id] = last_msg_id
 
-                    # Обрабатываем сообщение
-                    await self.process_message(last_msg)
+        # Обработчик команды /start
+        @self.client.on(events.NewMessage(pattern='(?i)/start'))
+        async def start_handler(event):
+            """Обработчик команды /start"""
+            await event.respond(
+                "🤖 **Бот запущен и готов к работе!**\n\n"
+                f"Я буду автоматически обрабатывать сообщения от @{TARGET_BOT}\n"
+                "и отвечать на личные сообщения.\n\n"
+                "📊 **Статистика:**\n"
+                f"• Активных чатов: {len(self.active_chats)}\n"
+                f"• Всего чатов в базе: {len(self.chats)}\n\n"
+                "ℹ️ Используйте /help для списка команд",
+                parse_mode='Markdown'
+            )
 
-    async def process_message(self, message):
-        """Обработка одного сообщения"""
-        try:
-            # Получаем информацию о сообщении
-            sender = await message.get_sender()
-            chat = await message.get_chat()
-            message_text = message.message or ""
+        # Обработчик команды /help
+        @self.client.on(events.NewMessage(pattern='(?i)/help'))
+        async def help_handler(event):
+            """Обработчик команды /help"""
+            help_text = """
+📋 **Доступные команды:**
 
-            # Пропускаем сообщения от самого себя
-            me = await self.client.get_me()
-            if sender.id == me.id:
+/start - Запустить бота и показать статистику
+/help - Показать это сообщение
+/status - Подробный статус бота
+/stats - Статистика по чатам
+/list - Список всех чатов
+/join [ссылка] - Вступить в канал/чат по ссылке
+/leave [id] - Покинуть чат по ID
+
+⚙️ **Настройки:**
+- Автообработка сообщений от @gram_piarbot
+- Ответы на личные сообщения
+- Автовступление в каналы из ЛС
+- Логирование всех действий
+            """
+            await event.respond(help_text, parse_mode='Markdown')
+
+        # Обработчик команды /status
+        @self.client.on(events.NewMessage(pattern='(?i)/status'))
+        async def status_handler(event):
+            """Обработчик команды /status"""
+            status_text = f"""
+📊 **Статус бота:**
+
+✅ **Активен**
+👤 **Пользователь:** {me.first_name} (@{me.username})
+📅 **Активных чатов:** {len(self.active_chats)}
+🗂️ **Всего в базе:** {len(self.chats)}
+🕒 **Время работы:** {datetime.now().strftime('%H:%M:%S')}
+📡 **Целевой бот:** @{TARGET_BOT}
+⏱️ **Интервал отправки:** {MESSAGE_INTERVAL} сек
+            """
+            await event.respond(status_text, parse_mode='Markdown')
+
+        # Обработчик команды /stats
+        @self.client.on(events.NewMessage(pattern='(?i)/stats'))
+        async def stats_handler(event):
+            """Обработчик команды /stats"""
+            # Считаем статистику по типам чатов
+            channels = sum(1 for c in self.chats.values() if c.is_channel)
+            groups = sum(1 for c in self.chats.values() if c.is_group)
+            active = sum(1 for c in self.chats.values() if c.status == ChatStatus.ACTIVE)
+
+            stats_text = f"""
+📈 **Статистика чатов:**
+
+🔹 **Всего чатов:** {len(self.chats)}
+🔹 **Активных:** {active}
+🔹 **Каналов:** {channels}
+🔹 **Групп:** {groups}
+🔹 **Приостановлено:** {len(self.chats) - active}
+
+📊 **По статусам:**
+• ✅ Активных: {sum(1 for c in self.chats.values() if c.status == ChatStatus.ACTIVE)}
+• ⏸️ Приостановлено: {sum(1 for c in self.chats.values() if c.status == ChatStatus.PAUSED)}
+• 🚪 Покинуто: {sum(1 for c in self.chats.values() if c.status == ChatStatus.LEFT)}
+• 🚫 Заблокировано: {sum(1 for c in self.chats.values() if c.status == ChatStatus.BANNED)}
+            """
+            await event.respond(stats_text, parse_mode='Markdown')
+
+        # Обработчик команды /list
+        @self.client.on(events.NewMessage(pattern='(?i)/list'))
+        async def list_handler(event):
+            """Обработчик команды /list"""
+            if not self.chats:
+                await event.respond("📭 Список чатов пуст")
                 return
 
-            print(f"\n📩 [{datetime.now().strftime('%H:%M:%S')}] Новое сообщение:")
-            print(f"   👤 От: {sender.first_name} (@{sender.username})")
-            print(f"   💬 Текст: {message_text[:100]}...")
+            response = "📋 **Список чатов:**\n\n"
+            for i, (chat_id, chat) in enumerate(list(self.chats.items())[:20], 1):  # Ограничиваем 20 чатами
+                status_emoji = {
+                    ChatStatus.ACTIVE: "✅",
+                    ChatStatus.PAUSED: "⏸️",
+                    ChatStatus.LEFT: "🚪",
+                    ChatStatus.BANNED: "🚫"
+                }.get(chat.status, "❓")
 
-            # Проверяем, является ли сообщение командой
-            if message_text.startswith('/'):
-                await self.process_command(message)
-            elif message.is_private:
-                # Автоответ на личные сообщения
-                response = f"Привет. Го ВЗ: @roblox_ru_chat"
-                await message.reply(response)
-                print(f"   ✅ Автоответ отправлен")
+                response += f"{i}. {status_emoji} **{chat.title}**\n"
+                response += f"   ID: {chat_id}\n"
+                if chat.username:
+                    response += f"   @{chat.username}\n"
+                response += f"   Тип: {'Канал' if chat.is_channel else 'Группа' if chat.is_group else 'Неизвестно'}\n"
+                response += f"   Участников: {chat.participants_count}\n"
+                response += f"   Добавлен: {chat.joined_at[:10]}\n\n"
 
-        except Exception as e:
-            print(f"❌ Ошибка обработки сообщения: {e}")
+            if len(self.chats) > 20:
+                response += f"\n... и еще {len(self.chats) - 20} чатов"
 
-    async def process_command(self, message):
-        """Обработка команд"""
-        try:
-            command = message.message.lower().strip()
-            sender = await message.get_sender()
+            await event.respond(response, parse_mode='Markdown')
 
-            # Получаем информацию о себе
-            me = await self.client.get_me()
-
-            print(f"\n⚡️ [{datetime.now().strftime('%H:%M:%S')}] Команда: {command}")
-            print(f"   👤 От: {sender.first_name} (@{sender.username})")
-
-            # Проверяем, что команда от владельца
-            allowed_users = [
-                me.id,  # Ваш ID
-                8114855403  # ID пользователя @marss73 (замените на реальный)  # Можно добавить других пользователей
-            ]
-
-            if sender.id not in allowed_users:
-                await message.reply("❌ У вас нет прав для использования команд")
+        # Обработчик команды /join
+        @self.client.on(events.NewMessage(pattern='(?i)/join'))
+        async def join_handler(event):
+            """Обработчик команды /join"""
+            args = event.message.text.split()
+            if len(args) < 2:
+                await event.respond("❌ Использование: /join [ссылка]")
                 return
 
-            print("   ✅ Владелец подтвержден")
+            link = args[1]
+            await event.respond(f"🔄 Пытаюсь присоединиться к: {link}")
 
-            if command == '/start':
-                await message.reply("🤖 Бот запущен и работает!")
-                print("   ✅ Ответ: /start")
-
-            elif command == '/help':
-                help_text = """
-🤖 **Доступные команды:**
-
-**Основные команды:**
-/start - Проверка работы бота
-/help - Эта справка
-/me - Информация о боте
-/chats - Список диалогов
-/send <id> <текст> - Отправить сообщение
-/join <ссылка> - Вступить в канал/группу
-/stop - Остановить бота
-
-**Команды автоотправки:**
-/autosend status - Статус автоотправки
-/autosend start - Запустить автоотправку
-/autosend stop - Остановить автоотправку
-/autosend interval <секунды> - Изменить интервал
-/autosend addchat <ID> - Добавить чат
-/autosend removechat <ID> - Удалить чат
-/autosend listchats - Список чатов
-/autosend addmsg <текст> - Добавить сообщение
-/autosend removemsg <номер> - Удалить сообщение
-/autosend listmsgs - Список сообщений
-/autosend now - Отправить сейчас
-                """
-                await message.reply(help_text)
-                print("   ✅ Ответ: /help")
-
-            elif command == '/me':
-                me = await self.client.get_me()
-                info = f"""
-👤 **Информация о боте:**
-Имя: {me.first_name}
-Фамилия: {me.last_name or 'Не указана'}
-Username: @{me.username or 'Не указан'}
-ID: {me.id}
-Телефон: {me.phone or 'Не указан'}
-                """
-                await message.reply(info)
-                print("   ✅ Ответ: /me")
-
-            elif command.startswith('/send '):
-                parts = command.split(' ', 2)
-                if len(parts) >= 3:
-                    chat_id = parts[1]
-                    text = parts[2]
-
-                    try:
-                        await self.client.send_message(chat_id, text)
-                        await message.reply(f"✅ Сообщение отправлено в {chat_id}")
-                        print(f"   ✅ Отправлено в {chat_id}")
-                    except Exception as e:
-                        await message.reply(f"❌ Ошибка: {e}")
-                        print(f"   ❌ Ошибка: {e}")
-
-            elif command.startswith('/join '):
-                parts = command.split(' ', 1)
-                if len(parts) >= 2:
-                    link = parts[1].strip()
-
-                    try:
-                        # Обработка разных форматов ссылок
-                        if 't.me/+' in link:
-                            # Пригласительная ссылка на группу в формате t.me/+
-                            if 'https://t.me/+' in link:
-                                # Полный URL: https://t.me/+uIKykIHp9_A5ZDIy
-                                invite_hash = link.replace('https://t.me/+', '')
-                            elif 't.me/+' in link:
-                                # Без https: t.me/+uIKykIHp9_A5ZDIy
-                                invite_hash = link.split('t.me/+')[-1]
-                            # Убираем возможные параметры после ? и /
-                            invite_hash = invite_hash.split('?')[0].split('/')[0]
-                            print(f"   🔍 Пытаюсь вступить с invite_hash: {invite_hash}")
-                            # Пробуем вступить
-                            await self.client(ImportChatInviteRequest(invite_hash))
-                            await message.reply(f"✅ Успешно вступил в приватную группу")
-                            print(f"   ✅ Вступил в приватную группу")
-
-                        elif 't.me/joinchat/' in link:
-                            # Старый формат: t.me/joinchat/...
-                            if 'https://t.me/joinchat/' in link:
-                                invite_hash = link.replace('https://t.me/joinchat/', '')
-                            else:
-                                invite_hash = link.split('t.me/joinchat/')[-1]
-                            invite_hash = invite_hash.split('?')[0].split('/')[0]
-                            print(f"   🔍 Пытаюсь вступить с invite_hash: {invite_hash}")
-                            await self.client(ImportChatInviteRequest(invite_hash))
-                            await message.reply(f"✅ Успешно вступил в приватную группу")
-                            print(f"   ✅ Вступил в приватную группу")
-
-                        else:
-                            # Публичный канал/группа
-                            # Убираем @ если есть
-                            if link.startswith('@'):
-                                link = link[1:]
-                            # Убираем https:// если есть
-                            if link.startswith('https://t.me/'):
-                                link = link.replace('https://t.me/', '')
-                            print(f"   🔍 Пытаюсь вступить в публичный чат: {link}")
-
-                            # Получаем сущность чата
-                            entity = await self.client.get_entity(link)
-                            # Определяем тип чата для более информативного сообщения
-                            chat_type = "канал" if getattr(entity, 'broadcast', False) else "группу"
-                            chat_title = getattr(entity, 'title', link)
-                            await self.client(JoinChannelRequest(entity))
-                            await message.reply(f"✅ Успешно вступил в {chat_type}: {chat_title}")
-                            print(f"   ✅ Вступил в {chat_type}: {chat_title}")
-
-                    except errors.InviteHashExpiredError:
-                        await message.reply("❌ Срок действия пригласительной ссылки истек")
-                        print(f"   ❌ Ссылка устарела: {link}")
-
-                    except errors.InviteHashInvalidError:
-                        # Попробуем альтернативный метод для ссылок формата t.me/+
-                        if 't.me/+' in link:
-                            await message.reply("❌ Неверная пригласительная ссылка. Попробуйте:\n"
-
-                                                "1. Проверить, что ссылка актуальна\n"
-
-                                                f"2. Использовать только хэш: {invite_hash if 'invite_hash' in locals() else 'неизвестно'}")
-                        else:
-                            await message.reply("❌ Неверная пригласительная ссылка")
-                        print(f"   ❌ Неверная ссылка: {link}")
-                    except errors.UserAlreadyParticipantError:
-
-                        await message.reply("ℹ️ Я уже состою в этом чате")
-
-                        print(f"   ℹ️ Уже в чате: {link}")
-                    except errors.ChannelPrivateError:
-                        await message.reply("🔒 Этот чат приватный. Нужна пригласительная ссылка")
-                        print(f"   🔒 Приватный чат: {link}")
-
-                    except errors.UsernameNotOccupiedError:
-                        await message.reply("❌ Такого чата/канала не существует")
-                        print(f"   ❌ Несуществующий чат: {link}")
-
-                    except errors.FloodWaitError as e:
-                        await message.reply(f"⏳ Слишком много запросов. Подождите {e.seconds} секунд")
-                        print(f"   ⏳ FloodWait: {e.seconds} сек")
-
-                    except Exception as e:
-                        error_msg = str(e)
-                        print(f"   ❌ Ошибка при вступлении в {link}: {error_msg}")
-
-                        if "Cannot find any entity corresponding to" in error_msg:
-                            await message.reply("❌ Не удалось найти чат. Проверьте ссылку")
-                        elif "The invite hash has expired" in error_msg:
-                            await message.reply("❌ Срок действия пригласительной ссылки истек")
-                        else:
-                            await message.reply(f"❌ Ошибка: {error_msg}")
-
-            elif command == '/chats':
-                # Получаем диалоги
-                dialogs = await self.client.get_dialogs(limit=20)
-
-                response = "💬 **Последние диалоги:**\n\n"
-                for dialog in dialogs[:10]:
-                    name = dialog.name
-                    if hasattr(dialog.entity, 'username') and dialog.entity.username:
-                        name = f"@{dialog.entity.username}"
-
-                    response += f"• {name} (ID: {dialog.id})\n"
-
-                await message.reply(response)
-                print("   ✅ Ответ: /chats")
-
-            # ========== КОМАНДЫ АВТООТПРАВКИ ==========
-            elif command == '/autosend status':
-                status_text = f"""
-📊 **Статус автоотправки:**
-
-• Включено: {'✅ Да' if self.auto_send_enabled else '❌ Нет'}
-• Интервал: {self.auto_send_interval} сек ({self.auto_send_interval // 60} мин)
-• Чатов: {len(self.auto_send_chats)}
-• Сообщений: {len(self.auto_send_messages)}
-• Текущий индекс: {self.message_index}
-                """
-
-                if self.next_send_time:
-                    status_text += f"• Следующая отправка: {self.next_send_time.strftime('%H:%M:%S')}\n"
-
-                await message.reply(status_text)
-                print("   ✅ Ответ: /autosend status")
-
-            elif command == '/autosend start':
-                self.auto_send_enabled = True
-                await self.start_auto_send()
-                await message.reply("✅ Автоотправка запущена")
-                print("   ✅ Автоотправка запущена")
-
-            elif command == '/autosend stop':
-                self.auto_send_enabled = False
-                if self.auto_send_task:
-                    self.auto_send_task.cancel()
-                await message.reply("🛑 Автоотправка остановлена")
-                print("   ✅ Автоотправка остановлена")
-
-            elif command.startswith('/autosend interval '):
-                parts = command.split(' ', 2)
-                if len(parts) >= 3:
-                    try:
-                        interval = int(parts[2])
-                        if interval < 10:
-                            await message.reply("❌ Интервал не может быть меньше 10 секунд")
-                            print("   ❌ Интервал слишком мал")
-                        else:
-                            self.auto_send_interval = interval
-                            await self.save_config()
-                            await message.reply(f"✅ Интервал изменен на {interval} сек ({interval // 60} мин)")
-                            print(f"   ✅ Интервал изменен на {interval} сек")
-                    except ValueError:
-                        await message.reply("❌ Неверный формат числа")
-                        print("   ❌ Неверный формат числа")
-
-            elif command.startswith('/autosend addchat '):
-                parts = command.split(' ', 2)
-                if len(parts) >= 3:
-                    chat_id = parts[2]
-                    if chat_id not in self.auto_send_chats:
-                        self.auto_send_chats.append(chat_id)
-                        await self.save_config()
-                        await message.reply(f"✅ Чат {chat_id} добавлен")
-                        print(f"   ✅ Чат {chat_id} добавлен")
-                    else:
-                        await message.reply(f"⚠️  Чат {chat_id} уже в списке")
-                        print(f"   ⚠️  Чат уже в списке")
-            elif command.startswith('/autosend removechat '):
-                parts = command.split(' ', 2)
-                if len(parts) >= 3:
-                    chat_id = parts[2]
-                    if chat_id in self.auto_send_chats:
-                        self.auto_send_chats.remove(chat_id)
-                        await self.save_config()
-                        await message.reply(f"✅ Чат {chat_id} удален")
-                        print(f"   ✅ Чат {chat_id} удален")
-                    else:
-                        await message.reply(f"❌ Чат {chat_id} не найден")
-                        print(f"   ❌ Чат не найден")
-
-            elif command == '/autosend listchats':
-                if not self.auto_send_chats:
-                    await message.reply("📋 Список чатов пуст")
-                    print("   ✅ Список чатов пуст")
-                else:
-                    response = "📋 **Чаты для автоотправки:**\n\n"
-                    for i, chat in enumerate(self.auto_send_chats, 1):
-                        response += f"{i}. {chat}\n"
-                    await message.reply(response)
-                    print(f"   ✅ Список из {len(self.auto_send_chats)} чатов")
-
-            elif command.startswith('/autosend addmsg '):
-                parts = command.split(' ', 2)
-                if len(parts) >= 3:
-                    message_text = parts[2]
-                    self.auto_send_messages.append(message_text)
-                    await self.save_config()
-                    await message.reply(f"✅ Сообщение добавлено (всего: {len(self.auto_send_messages)})")
-                    print(f"   ✅ Сообщение добавлено")
-
-            elif command.startswith('/autosend removemsg '):
-                parts = command.split(' ', 2)
-                if len(parts) >= 3:
-                    try:
-                        index = int(parts[2]) - 1
-                        if 0 <= index < len(self.auto_send_messages):
-                            removed = self.auto_send_messages.pop(index)
-                            await self.save_config()
-                            await message.reply(f"✅ Сообщение удалено: {removed[:50]}...")
-                            print(f"   ✅ Сообщение удалено")
-                        else:
-                            await message.reply(f"❌ Неверный номер сообщения")
-                            print(f"   ❌ Неверный номер")
-                    except ValueError:
-                        await message.reply("❌ Неверный формат номера")
-                        print(f"   ❌ Неверный формат")
-
-            elif command == '/autosend listmsgs':
-                if not self.auto_send_messages:
-                    await message.reply("📋 Список сообщений пуст")
-                    print("   ✅ Список сообщений пуст")
-                else:
-                    response = "📋 **Сообщения для автоотправки:**\n\n"
-                    for i, msg in enumerate(self.auto_send_messages, 1):
-                        response += f"{i}. {msg[:50]}...\n"
-                    await message.reply(response)
-                    print(f"   ✅ Список из {len(self.auto_send_messages)} сообщений")
-
-            elif command == '/autosend now':
-                await message.reply("⏳ Отправляю сообщения сейчас...")
-                print("   ⏳ Начинаю отправку...")
-                await self.send_to_all_chats()
-                await message.reply("✅ Сообщения отправлены")
-                print("   ✅ Сообщения отправлены")
-
-            elif command == '/stop':
-                await message.reply("🛑 Остановка бота...")
-                print("   🛑 Остановка бота...")
-                await self.stop()
-
+            chat_info = await self.join_channel(link)
+            if chat_info:
+                await event.respond(
+                    f"✅ Успешно присоединился!\n\n"
+                    f"**Название:** {chat_info.title}\n"
+                    f"**ID:** {chat_info.id}\n"
+                    f"**Тип:** {'Канал' if chat_info.is_channel else 'Группа'}\n"
+                    f"**Статус:** {chat_info.status.value}",
+                    parse_mode='Markdown'
+                )
             else:
-                await message.reply("❌ Неизвестная команда. Используйте /help")
-                print("   ❌ Неизвестная команда")
+                await event.respond(f"❌ Не удалось присоединиться к: {link}")
 
-        except Exception as e:
-            print(f"❌ Ошибка обработки команды: {e}")
-            try:
-                await message.reply(f"❌ Ошибка: {str(e)}")
-            except:
-                pass
+        logger.info(f"✅ Бот запущен и готов к работе!")
+        logger.info(f"📱 Ожидание сообщений от @{TARGET_BOT}...")
 
-    async def load_auto_send_config(self):
-        """Загрузка конфигурации автоотправки"""
-        config_file = 'auto_send_config.json'
+        if self.message_text:
+            logger.info(f"📝 Текст сообщения: {self.message_text[:50]}...")
+        logger.info(f"⏱️ Интервал отправки: {MESSAGE_INTERVAL} секунд")
 
-        if os.path.exists(config_file):
-            try:
-                with open(config_file, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
+        # Сохраняем данные перед запуском
+        self.save_data()
 
-                self.auto_send_enabled = config.get('enabled', True)
-                self.auto_send_interval = config.get('interval', 180)
-                self.auto_send_chats = config.get('chats', [])
-                self.auto_send_messages = config.get('messages', [])
-
-                print(f"\n📋 Загружена конфигурация автоотправки:")
-                print(f"   • Включено: {'Да' if self.auto_send_enabled else 'Нет'}")
-                print(f"   • Интервал: {self.auto_send_interval} сек ({self.auto_send_interval // 60} мин)")
-                print(f"   • Чатов: {len(self.auto_send_chats)}")
-                print(f"   • Сообщений: {len(self.auto_send_messages)}")
-
-            except Exception as e:
-                print(f"❌ Ошибка загрузки конфигурации: {e}")
-                # Создаем дефолтную конфигурацию
-                await self.create_default_config()
-        else:
-            print("\n📋 Файл конфигурации не найден, создаем дефолтный...")
-            await self.create_default_config()
-
-    async def create_default_config(self):
-        """Создание дефолтной конфигурации"""
-        config = {
-            'enabled': True,
-            'interval': 180,  # 3 минуты
-            'chats': [],  # Добавьте сюда ID чатов
-            'messages': [
-                "Привет всем! 👋",
-                "Как дела? 🤔",
-                "Отличный день для общения! ☀️",
-                "Что нового? 📰"
-            ]
-        }
-
-        try:
-            with open('auto_send_config.json', 'w', encoding='utf-8') as f:
-                json.dump(config, f, ensure_ascii=False, indent=2)
-            print("✅ Создан файл конфигурации auto_send_config.json")
-            print("⚠️  Отредактируйте его, добавив ID чатов!")
-        except Exception as e:
-            print(f"❌ Ошибка создания конфигурации: {e}")
-
-    async def start_auto_send(self):
-        """Запуск задачи автоотправки"""
-        if not self.auto_send_enabled:
-            print("⚠️  Автоотправка отключена в настройках")
-            return
-
-        if not self.auto_send_chats:
-            print("⚠️  Не указаны чаты для автоотправки")
-            print("   Используйте команду /autosend addchat <ID>")
-            return
-
-        if not self.auto_send_messages:
-            print("⚠️  Не указаны сообщения для автоотправки")
-            print("   Используйте команду /autosend addmsg <текст>")
-            return
-
-        print(f"\n🚀 Запуск автоотправки сообщений:")
-        print(f"   • Чатов: {len(self.auto_send_chats)}")
-        print(f"   • Сообщений: {len(self.auto_send_messages)}")
-        print(f"   • Интервал: {self.auto_send_interval} сек")
-
-        # Запускаем задачу
-        self.auto_send_task = asyncio.create_task(self.auto_send_loop())
-
-        # Устанавливаем время следующей отправки
-        self.next_send_time = datetime.now() + timedelta(seconds=self.auto_send_interval)
-        print(f"   • Следующая отправка: {self.next_send_time.strftime('%H:%M:%S')}")
-
-    async def auto_send_loop(self):
-        """Основной цикл автоотправки"""
-        while self.is_running and self.auto_send_enabled:
-            try:
-                # Ждем указанный интервал
-                await asyncio.sleep(self.auto_send_interval)
-
-                # Отправляем сообщения
-                await self.send_to_all_chats()
-
-                # Обновляем время следующей отправки
-                self.next_send_time = datetime.now() + timedelta(seconds=self.auto_send_interval)
-
-            except asyncio.CancelledError:
-                print("🛑 Задача автоотправки остановлена")
-                break
-            except Exception as e:
-                print(f"❌ Ошибка в цикле автоотправки: {e}")
-                await asyncio.sleep(60)  # Ждем минуту при ошибке
-
-    async def send_to_all_chats(self):
-        """Отправка сообщений во все чаты"""
-        if not self.auto_send_chats or not self.auto_send_messages:
-            return
-
-        print(f"\n📤 [{datetime.now().strftime('%H:%M:%S')}] Начинаю отправку...")
-
-        # Получаем следующее сообщение
-        message = self.auto_send_messages[self.message_index]
-        self.message_index = (self.message_index + 1) % len(self.auto_send_messages)
-
-        success_count = 0
-        fail_count = 0
-
-        for chat in self.auto_send_chats:
-            try:
-                # Отправляем сообщение
-                await self.client.send_message(chat, message)
-                print(f"   ✅ Отправлено в {chat}")
-                success_count += 1
-
-                # Небольшая задержка между отправками
-                await asyncio.sleep(1)
-
-            except Exception as e:
-                print(f"   ❌ Ошибка отправки в {chat}: {e}")
-                fail_count += 1
-
-        print(f"📊 Итог: {success_count} успешно, {fail_count} с ошибками")
-        print(f"⏰ Следующая отправка: {self.next_send_time.strftime('%H:%M:%S')}")
-
-    async def message_check_loop(self):
-        """Цикл проверки новых сообщений"""
-        print("🔍 Запуск цикла проверки сообщений...")
-
-        while self.is_running:
-            try:
-                # Проверяем новые сообщения каждые 5 секунд
-                await self.check_new_messages()
-                await asyncio.sleep(5)
-
-            except asyncio.CancelledError:
-                print("🛑 Проверка сообщений остановлена")
-                break
-            except Exception as e:
-                print(f"❌ Ошибка проверки сообщений: {e}")
-                await asyncio.sleep(10)
-
-    async def save_config(self):
-        """Сохранение конфигурации"""
-        config = {
-            'enabled': self.auto_send_enabled,
-            'interval': self.auto_send_interval,
-            'chats': self.auto_send_chats,
-            'messages': self.auto_send_messages
-        }
-
-        try:
-            with open('auto_send_config.json', 'w', encoding='utf-8') as f:
-                json.dump(config, f, ensure_ascii=False, indent=2)
-            print("✅ Конфигурация сохранена")
-        except Exception as e:
-            print(f"❌ Ошибка сохранения конфигурации: {e}")
-
-    async def start(self):
-        """Запуск основного цикла бота"""
-        if not self.client:
-            print("❌ Клиент не инициализирован")
-            return
-
-        self.is_running = True
-
-        # Запускаем автоотправку
-        if self.auto_send_enabled:
-            await self.start_auto_send()
-
-        # Запускаем проверку сообщений
-        self.message_check_task = asyncio.create_task(self.message_check_loop())
-
-        print("\n" + "=" * 50)
-        print("🚀 Бот успешно запущен и готов к работе!")
-        print("=" * 50)
-        print("\n💬 Отправьте /help для списка команд")
-        print("📡 Бот теперь слушает все входящие сообщения!")
-        print("⏸️  Нажмите Ctrl+C для остановки")
-
-        # Бесконечный цикл
-        try:
-            while self.is_running:
-                await asyncio.sleep(1)
-        except KeyboardInterrupt:
-            print("\n\n🛑 Получен сигнал остановки...")
-            await self.stop()
-
-    async def stop(self):
-        """Остановка бота"""
-        self.is_running = False
-
-        # Останавливаем задачи
-        if self.auto_send_task:
-            self.auto_send_task.cancel()
-
-        if self.message_check_task:
-            self.message_check_task.cancel()
-
-        # Отключаем клиент
-        if self.client:
-            await self.client.disconnect()
-
-        print("\n✅ Бот остановлен")
-        sys.exit(0)
+        # Запускаем бесконечный цикл
+        await self.client.run_until_disconnected()
 
 
-# ========== ГЛАВНАЯ ФУНКЦИЯ ==========
+# ==================== ЗАПУСК БОТА ====================
 async def main():
-    bot = TelegramUserBot()
-
-    # Инициализируем бота
-    if not await bot.initialize():
-        print("❌ Не удалось инициализировать бота")
-        return
-
-    # Запускаем основной цикл
-    await bot.start()
-
-
-# ========== ТОЧКА ВХОДА ==========
-if __name__ == "__main__":
-    # Настройка логирования
-    logging.basicConfig(
-        level=Config.LOG_LEVEL,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-
+    bot = TelegramAutoJoinBot()
     try:
-        # Запускаем асинхронный цикл
-        asyncio.run(main())
+        await bot.run()
     except KeyboardInterrupt:
-        print("\n\n👋 До свидания!")
+        logger.info("\n🛑 Бот остановлен пользователем")
+        bot.save_data()
     except Exception as e:
-        print(f"\n❌ Критическая ошибка: {e}")
+        logger.error(f"❌ Критическая ошибка: {e}")
+        bot.save_data()
+
+
+if __name__ == '__main__':
+    # Устанавливаем кодировку для Windows
+    if os.name == 'nt':
+        import sys
+
+        sys.stdout.reconfigure(encoding='utf-8')
+
+    # Запускаем бота
+    asyncio.run(main())
